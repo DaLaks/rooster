@@ -21,8 +21,8 @@ class Core:
             self.dnplmb = reactor.control.input['dnplmb']
             self.betaeff = reactor.control.input['betaeff']
             self.cdnp = [0] * self.ndnp
-            for i in range(self.ndnp) :
-                self.cdnp[i] = self.betaeff[i]*self.power/(self.dnplmb[i]*self.tlife)
+            for i in range(self.ndnp):
+                self.cdnp[i] = self.betaeff[i] * self.power / (self.dnplmb[i] * self.tlife)
             if 'power0' not in reactor.control.input:
                 print('***ERROR: there is no card power0 in the input.')
                 sys.exit()
@@ -69,7 +69,9 @@ class Core:
 
             # initialize flux
             self.flux = numpy.ones(shape=(self.nz, self.nx, self.ny, self.nt, self.ng), order='F')
-
+            # initialize adjoint flux if AD is selected
+            if self.meth == 'AD':
+                self.flux_a = numpy.ones(shape=(self.nz, self.nx, self.ny, self.nt, self.ng), order='F')
             # create a list of all isotopes
             self.isoname = [x['isoid'][i] for x in reactor.control.input['mix'] for i in range(len(x['isoid']))]
             #remove duplicates
@@ -225,7 +227,7 @@ class Core:
             for imix in range(self.nmix):
                 for indx in range(nsign2n[imix]):
                     fsign2n[imix][indx] = self.mix[imix].sign2n[indx][0][0]
-                    tsign2n[imix][indx] = self.mix[imix].sign2n[indx][0][1]            
+                    tsign2n[imix][indx] = self.mix[imix].sign2n[indx][0][1]
                     sign2n[imix][indx] = self.mix[imix].sign2n[indx][1]
 
             # transport cross section = total cross section - first Legendre component of elastic out-scattering cross section 
@@ -233,12 +235,29 @@ class Core:
 
             reactor.tic = time.time()
 
-            # call the Fortran eigenvalue problem solver
-            B3_coreF.solve_eigenvalue_problem(self.meth, self.geom, self.nz, self.nx, self.ny, self.nt, self.ng, self.nmix, \
-                                              self.flux, self.map['imix'], sigt, sigtra, sigp, \
-                                              nsigsn, fsigsn, tsigsn, sigsn, \
-                                              nsign2n, fsign2n, tsign2n, sign2n, chi, \
-                                              self.pitch, dz)
+            if self.meth == 'AD':
+                # call Fortran solver for flux first with direct diffusion (DI card for method)
+                B3_coreF.solve_eigenvalue_problem('DI', self.geom, self.nz, self.nx, self.ny, self.nt, self.ng,
+                                                  self.nmix,
+                                                  self.flux, self.map['imix'], sigt, sigtra, sigp,
+                                                  nsigsn, fsigsn, tsigsn, sigsn,
+                                                  nsign2n, fsign2n, tsign2n, sign2n, chi,
+                                                  self.pitch, dz)
+
+                # Call fortran solver for adjoint problem
+                B3_coreF.solve_eigenvalue_problem(self.meth, self.geom, self.nz, self.nx, self.ny, self.nt, self.ng,
+                                                  self.nmix,
+                                                  self.flux_a, self.map['imix'], sigt, sigtra, sigp,
+                                                  nsigsn, fsigsn, tsigsn, sigsn,
+                                                  nsign2n, fsign2n, tsign2n, sign2n, chi,
+                                                  self.pitch, dz)
+            else :
+                # call the Fortran eigenvalue problem solver
+                B3_coreF.solve_eigenvalue_problem(self.meth, self.geom, self.nz, self.nx, self.ny, self.nt, self.ng,
+                                                  self.nmix, self.flux, self.map['imix'], sigt, sigtra, sigp, nsigsn, fsigsn, tsigsn, sigsn,
+                                                  nsign2n, fsign2n, tsign2n, sign2n, chi, self.pitch, dz)
+
+
             tac = time.time()
             print('{0:.3f}'.format(tac - reactor.tic), ' s | eigenvalue problem done.')
 
@@ -277,6 +296,8 @@ class Core:
                         for it in range(self.nt):
                             for ig in range(self.ng):
                                 self.flux[iz][ix][iy][it][ig] *= factor
+                                # Normalize adjoint flux by same pow as for flux
+                                self.flux_a[iz][ix][iy][it][ig] *= factor
             for ix in range(self.nx):
                 for iy in range(self.ny):
                     self.powxy[ix][iy] *= factor

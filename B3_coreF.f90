@@ -11,7 +11,7 @@ use omp_lib
  
 implicit none
 
-! method flag ('MC', 'DI')
+! method flag ('MC', 'DI', 'AD') - AD for adjoint diffusion
 character*2 meth
 ! geometry flag ('squar', 'hex01', 'hex06', 'hex24')
 character*5 geom
@@ -82,6 +82,8 @@ real*8 knew
 real*8 mlt
 ! fission source
 real*8 qf(nz,nx,ny,nt)
+! fission source for adjoint problem
+real*8 qff(nz,nx,ny,nt)
 ! total fission source
 real*8 tfs
 ! fission source
@@ -94,6 +96,8 @@ real*8 qs
 real*8 rtol
 ! removal cross section
 real*8 sigr
+! sum of sigp for keff_a
+real*8 sum_sigp
 
 ! Monte Carlo specific variables
 
@@ -638,7 +642,7 @@ if(meth == 'MC')then
       end do
    end do
 
-else
+else if(meth == 'DI') then
 
    ! DIFFUSION SOLVER
 
@@ -798,6 +802,170 @@ else
       end if
       if(isnan(keff)) stop
    
+   end do
+else if(meth == 'AD') then
+
+   ! ADJOINT DIFFUSION SOLVER
+
+   ! relative tolerance
+   rtol = 1.0e-8
+   ! absolute tolerance
+   atol = 1.0e-8
+
+   ! initialize fission source
+   qf = 1.
+
+   ! side area to volume ratio of control volume
+   if(geom == 'squar')then
+      aside_over_v = 1./pitch
+   else if(geom == 'hex01')then
+      aside_over_v = 2./(3.*pitch)
+   else if(geom == 'hex06')then
+      aside_over_v = 4./pitch
+   else ! geom == 'hex24'
+      aside_over_v = 8./pitch
+   end if
+
+   ! eigenvalue keff equal to ratio of total fission source at two iterations.
+   ! flux is normalise to total fission source = 1 at previous iteration
+   keff = 1.
+
+   ! convergence flag
+   converge_k = .false.
+   ! outer iteration counter
+   nitero = 0
+   do while(.not. converge_k .and. nitero < 1000)
+      nitero = nitero + 1
+      ! initialize flux convergence flag
+      converge_flux = .false.
+      ! inner iteration counter
+      niteri = 0
+      do while(.not. converge_flux .and. niteri < 5)
+         niteri = niteri + 1
+         converge_flux = .true.
+         !$omp parallel do default(shared) &
+         !$omp private(imix,az_over_v,mlt,dif,sigr,qs,f,t,qn2n,qfis,fluxnew)
+         do iz = 1,nz
+            do ix = 1,nx
+               do iy = 1,ny
+                  !$ if(omp_get_thread_num() == 0 .and. iz == 1 .and. ix == 1 .and. iy == 1) nthreads = OMP_get_num_threads()
+
+                  ! if (iy, ix, iz) is not a boundary condition node, i.e. not -1 (vac) and not -2 (ref)
+                  imix = imap(iz,ix,iy)
+                  if(imix > 0)then
+                     ! node axial area-to-volume ratio
+                     az_over_v = 1./dz(iz-1)
+                     do it = 1,nt
+                        do ig = 1,ng
+                           mlt = 0.
+                           dif = 0.
+
+                           ! diffusion terms (mlt and dif) in different nodalizations and different directions
+                           call mltdif(mlt, dif, iz, ix, iy, it, ig, imix, imap, nz, nx, ny, nt, ng, nmix, &
+                                       pitch, dz, sigtra, flux, aside_over_v, az_over_v, geom)
+
+                           ! removal xs
+                           sigr = sigt(imix,ig)
+                           do indx = 1,nsigsn(imix)
+                              f = fsigsn(1,imix,indx)+1
+                              t = tsigsn(1,imix,indx)+1
+                              if(f == ig .and. t == ig)then
+                                 sigr = sigr - sigsn(1,imix,indx)
+                              end if
+                           end do
+
+                           mlt = mlt + sigr
+
+                           ! scattering source
+                           qs = 0.
+                           do indx = 1,nsigsn(imix)
+                              f = fsigsn(1,imix,indx)+1
+                              t = tsigsn(1,imix,indx)+1
+                              if(t .ne. ig .and. f == ig)then
+                                 qs = qs + sigsn(1,imix,indx) * flux(iz,ix,iy,it,t)
+                              end if
+                           end do
+                           ! n2n source
+                           qn2n = 0.
+                           do indx = 1,nsign2n(imix)
+                              f = fsign2n(imix,indx)+1
+                              t = tsign2n(imix,indx)+1
+                              if(t .ne. ig .and. f == ig)then
+                                 qn2n = qn2n + 2.*sign2n(imix,indx)*flux(iz,ix,iy,it,t)
+                              end if
+                           end do
+
+                           ! fission source
+                           qfis = sigp(imix,ig)*qf(iz,ix,iy,it)/keff
+
+                           ! neutron flux
+                           fluxnew = (dif + qs + qn2n + qfis)/mlt
+                           if(converge_flux)then
+                              converge_flux = abs(fluxnew - flux(iz,ix,iy,it,ig)) < rtol*abs(fluxnew) + atol
+                           end if
+                           flux(iz,ix,iy,it,ig) = fluxnew
+                        end do
+                     end do
+                  end if
+               end do
+            end do
+         end do
+         !$omp end parallel do
+      end do
+
+      ! calculate node-wise fission source qf and total fission source tfs
+      !$omp parallel do default(shared) private(imix)
+      do iz = 1,nz
+         do ix = 1,nx
+            do iy = 1,ny
+               ! if (iz, ix, iy) is not a boundary condition node, i.e. not -1 (vac) and not -2 (ref)
+               imix = imap(iz,ix,iy)
+               if(imix > 0)then
+                  do it = 1,nt
+                     qf(iz,ix,iy,it) = 0.
+                     sum_sigp = 0.
+                     do ig = 1,ng
+                        qf(iz,ix,iy,it) = qf(iz,ix,iy,it) + chi(imix,ig)*flux(iz,ix,iy,it,ig)
+                        sum_sigp = sum_sigp + sigp(imix,ig)
+                     end do
+                     qff(iz,ix,iy,it) = qf(iz,ix,iy,it)*sum_sigp
+                  end do
+               end if
+            end do
+         end do
+      end do
+      !$omp end parallel do
+
+      ! calculate total fission source tfs
+      tfs = 0.
+      do iz = 1,nz
+         do ix = 1,nx
+            do iy = 1,ny
+               ! if (iz, iy, ix) is not a boundary condition node, i.e. not -1 (vac) and not -2 (ref)
+               imix = imap(iz,ix,iy)
+               if(imix > 0)then
+                  do it = 1,nt
+                     tfs = tfs + qff(iz,ix,iy,it)
+                  end do
+               end if
+            end do
+         end do
+      end do
+
+      ! new k-effective is the ratio of total fission sources at the current (tfs) and previous (1.0) iterations
+      knew = tfs
+      converge_k = abs(knew - keff) < rtol*abs(knew) + atol
+      keff = knew
+
+      if(nthreads == 0)then
+         write(*,'("keff: ",f13.6, " | niteri: ", i3, " | nitero: ", i3, " | ")') &
+               keff,niteri,nitero
+      else
+         write(*,'("keff: ",f13.6, " | niteri: ", i3, " | nitero: ", i3, " | OMPthreads: ", i3, " | ")') &
+               keff,niteri,nitero,nthreads
+      end if
+      if(isnan(keff)) stop
+
    end do
 end if
 
